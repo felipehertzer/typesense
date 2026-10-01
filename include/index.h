@@ -792,6 +792,10 @@ public:
 
     static float int64_t_to_float(int64_t n);
 
+    /// The double to store for a float: one that converts back to the same float and that the JSON printer writes in
+    /// few digits, usually 9 or fewer. A float widened to a double prints with up to 17.
+    static double float_as_short_double(float value);
+
     void get_distinct_id(posting_list_t::iterator_t& facet_index_it, const uint32_t seq_id,
                          const bool is_array, const bool group_missing_values, uint64_t& distinct_id,
                          bool is_reverse=false) const;

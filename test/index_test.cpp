@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include "index.h"
 #include <vector>
+#include <cstring>
+#include <limits>
+#include <random>
 #include <s2/s2loop.h>
 
 /*TEST(IndexTest, PointInPolygon180thMeridian) {
@@ -67,4 +70,52 @@ TEST(IndexTest, GeoPointPackUnpack) {
         ASSERT_FLOAT_EQ(latlng.first, s2LatLng.lat().degrees());
         ASSERT_FLOAT_EQ(latlng.second, s2LatLng.lng().degrees());
     }
+}
+
+TEST(IndexTest, FloatAsShortDoubleKeepsTheFloatInFewerDigits) {
+    size_t short_chars = 0, widened_chars = 0;
+
+    auto check = [&](float value) {
+        const double short_value = Index::float_as_short_double(value);
+        const float back = static_cast<float>(short_value);
+        ASSERT_EQ(0, std::memcmp(&value, &back, sizeof value)) << value;
+
+        const auto stored = nlohmann::json(short_value).dump();
+        const auto widened = nlohmann::json(static_cast<double>(value)).dump();
+        ASSERT_LE(stored.size(), widened.size()) << stored;
+        short_chars += stored.size();
+        widened_chars += widened.size();
+    };
+
+    for (const float value: {0.0f, -0.0f, 1.0f, -1.0f, 0.1f, 1e-7f, 3.4028235e38f, -3.4028235e38f,
+                             std::numeric_limits<float>::min(), std::numeric_limits<float>::denorm_min()}) {
+        check(value);
+    }
+
+    // Embedding values: most take 17 digits widened, at most 9 here.
+    short_chars = widened_chars = 0;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> embedding_value(-0.5f, 0.5f);
+    for (int i = 0; i < 100'000; i++) {
+        check(embedding_value(rng));
+    }
+    ASSERT_LE(short_chars, widened_chars * 65 / 100);
+
+    // Any finite float keeps its exact value.
+    std::uniform_int_distribution<uint32_t> any_bits(0, UINT32_MAX);
+    for (int i = 0; i < 100'000; i++) {
+        uint32_t bits = any_bits(rng);
+        float value;
+        std::memcpy(&value, &bits, sizeof value);
+        if (std::isfinite(value)) {
+            check(value);
+        }
+    }
+
+    // Not finite: returned as is.
+    ASSERT_TRUE(std::isinf(Index::float_as_short_double(std::numeric_limits<float>::infinity())));
+    ASSERT_TRUE(std::isnan(Index::float_as_short_double(std::numeric_limits<float>::quiet_NaN())));
+
+    ASSERT_EQ("0.10000000149011612", nlohmann::json(static_cast<double>(0.1f)).dump());
+    ASSERT_EQ("0.100000001", nlohmann::json(Index::float_as_short_double(0.1f)).dump());
 }

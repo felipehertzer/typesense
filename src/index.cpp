@@ -6,6 +6,10 @@
 #include <set>
 #include <unordered_map>
 #include <random>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <art.h>
 #include <array_utils.h>
 #include <match_score.h>
@@ -292,6 +296,38 @@ float Index::int64_t_to_float(int64_t n) {
     float f;
     memcpy(&f, &i, sizeof f);
     return f;
+}
+
+double Index::float_as_short_double(float value) {
+    const double widened = value;
+    if (!std::isfinite(value)) {
+        return widened;
+    }
+
+    // 9 significant digits identify every float, but the JSON printer (Grisu2) falls back to 17 digits for some
+    // doubles near the edge of their rounding interval, such as the one nearest 0.353712261. So a few precisions are
+    // tried, and the double kept is the one that prints shortest. The float check also covers double rounding.
+    double shortest = widened;
+    size_t shortest_size = SIZE_MAX;
+    char buf[32];
+    for (int precision = 9; precision <= 11; precision++) {
+        std::snprintf(buf, sizeof(buf), "%.*g", precision, value);
+        const double candidate = std::strtod(buf, nullptr);
+        if (static_cast<float>(candidate) != value) {
+            continue;
+        }
+
+        const size_t size = nlohmann::json(candidate).dump().size();
+        if (size <= std::strlen(buf)) {
+            return candidate;
+        }
+        if (size < shortest_size) {
+            shortest = candidate;
+            shortest_size = size;
+        }
+    }
+
+    return shortest_size < nlohmann::json(widened).dump().size() ? shortest : widened;
 }
 
 void Index::compute_token_offsets_facets(index_record& record,
@@ -8497,8 +8533,14 @@ void Index::process_embed_results(const std::vector<std::pair<index_record*, std
         for(size_t j = 0; j < avg_embedding.embedding.size(); j++) {
             avg_embedding.embedding[j] /= record.second.size();
         }
-        record.first->new_doc[the_field.name] = avg_embedding.embedding;
-        record.first->doc[the_field.name] = avg_embedding.embedding;
+
+        // The document is stored as JSON: widened to doubles the floats would take up to 17 digits each, most of an
+        // article's stored size, and every search that reads the document back would parse them.
+        std::vector<double> stored_embedding(avg_embedding.embedding.size());
+        std::transform(avg_embedding.embedding.begin(), avg_embedding.embedding.end(), stored_embedding.begin(),
+                       float_as_short_double);
+        record.first->new_doc[the_field.name] = stored_embedding;
+        record.first->doc[the_field.name] = stored_embedding;
     }
 }
 
