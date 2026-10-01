@@ -6983,3 +6983,61 @@ TEST_F(CollectionVectorTest, UpdateAPIKeyInSchema) {
     embedding_fields = coll->get_embedding_fields();
     ASSERT_EQ("xyzw", embedding_fields["embedding"].embed[fields::model_config][fields::api_key]);
 }
+
+TEST_F(CollectionVectorTest, GeneratedEmbeddingIsStoredInShortNumbers) {
+    // A generated embedding is stored with at most 9 significant digits per value instead of a widened double's 17,
+    // and the vector index holds exactly the floats the stored document reads back as.
+    nlohmann::json schema = R"({
+                "name": "coll1",
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "embedding", "type":"float[]", "embed":{"from": ["title"],
+                        "model_config": {"model_name": "ts/e5-small"}}}
+                ]
+            })"_json;
+
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+
+    Collection* coll1 = collectionManager.create_collection(schema).get();
+
+    const std::vector<std::string> titles = {"Rates rise again", "Bank profits fall", "New stadium opens"};
+    for (size_t i = 0; i < titles.size(); i++) {
+        nlohmann::json doc;
+        doc["id"] = std::to_string(i);
+        doc["title"] = titles[i];
+        ASSERT_TRUE(coll1->add(doc.dump()).ok());
+    }
+
+    auto doc_op = coll1->get("0");
+    ASSERT_TRUE(doc_op.ok());
+    const auto embedding = doc_op.get()["embedding"];
+    ASSERT_EQ(384, embedding.size());
+
+    nlohmann::json widened = nlohmann::json::array();
+    std::vector<std::string> values;
+    for (const auto& value: embedding) {
+        const double stored = value.get<double>();
+        ASSERT_EQ(stored, Index::float_as_short_double(static_cast<float>(stored)));
+        widened.push_back(static_cast<double>(static_cast<float>(stored)));
+        values.push_back(value.dump());
+    }
+    ASSERT_LE(embedding.dump().size(), widened.dump().size() * 8 / 10);
+
+    std::map<std::string, std::string> req_params = {
+        {"collection", "coll1"},
+        {"q", "*"},
+        {"vector_query", "embedding:([" + StringUtils::join(values, ",") + "], k: 3)"},
+        {"exclude_fields", "embedding"},
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok()) << search_op.error();
+
+    auto res = nlohmann::json::parse(json_res);
+    ASSERT_EQ(3, res["hits"].size());
+    ASSERT_EQ("0", res["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_NEAR(0, res["hits"][0]["vector_distance"].get<float>(), 1e-6);
+}
