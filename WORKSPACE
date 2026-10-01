@@ -44,16 +44,18 @@ git_repository(
 
 new_git_repository(
     name="onnx_runtime",
-    branch= "rel-1.14.1",
+    commit = "c57cf374b67f72575546d7b4c69a1af4972e2b54",  # rel-1.14.1 == v1.14.1
     build_file = "//bazel:onnxruntime.BUILD",
     remote= "https://github.com/microsoft/onnxruntime",
     patches=["//bazel:onnx.patch"],
-    patch_cmds= ["git submodule sync && git submodule foreach  'git fetch --tags' && git submodule update --init --remote"]
+    # The build needs the submodules' newer commits (`--remote`), but their tips move daily, so two builds linked
+    # different library versions. Each submodule is set to its last commit before the 31.0.rc17 build.
+    patch_cmds= ["git submodule sync && git submodule foreach  'git fetch --tags' && git submodule update --init --remote && git submodule foreach 'git checkout -q $(git rev-list -1 --before=2026-09-24T13:00:00Z HEAD)'"]
 )
 
 new_git_repository(
     name="clip_tokenizer",
-    branch="master",
+    commit="0ca1e2e2e7418108725eaa7fb93e029516ae63fa",
     remote="https://github.com/typesense/clip_tokenizer_cpp.git",
     build_file = "//bazel:clip_tokenizer.BUILD",
 )
