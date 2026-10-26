@@ -197,6 +197,8 @@ private:
 
     static int send_response(h2o_req_t *req, int status_code, const std::string & message);
 
+    static int discard_req_body_cb(void *ctx, int is_end_stream);
+
     static int async_req_cb(void *ctx, int is_end_stream);
 
     static bool is_write_request(const std::string& root_resource, const std::string& http_method,
