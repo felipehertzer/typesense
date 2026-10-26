@@ -928,6 +928,16 @@ void HttpServer::send_message(const std::string & type, void* data) {
 }
 
 int HttpServer::send_response(h2o_req_t *req, int status_code, const std::string & message) {
+    // A response can be sent before an HTTP/1 request body has fully arrived (e.g. a 404 or 401 decided on the
+    // headers alone). h2o then waits for the handler to read the rest of the body before it reads the next request
+    // on the connection, so the body must be drained: otherwise the connection stalls until the request timeout.
+    bool is_http_v1 = (req->version < 0x200);
+    if(is_http_v1 && req->proceed_req != nullptr && req->write_req.cb == nullptr) {
+        req->write_req.cb = discard_req_body_cb;
+        req->write_req.ctx = req;
+        req->proceed_req(req, nullptr);
+    }
+
     h2o_generator_t generator = {nullptr, nullptr};
     h2o_iovec_t body = h2o_strdup(&req->pool, message.c_str(), SIZE_MAX);
     req->res.status = status_code;
@@ -935,6 +945,15 @@ int HttpServer::send_response(h2o_req_t *req, int status_code, const std::string
     h2o_add_header(&req->pool, &req->res.headers, H2O_TOKEN_CONTENT_TYPE, nullptr, H2O_STRLIT("application/json; charset=utf-8"));
     h2o_start_response(req, &generator);
     h2o_send(req, &body, 1, H2O_SEND_STATE_FINAL);
+    return 0;
+}
+
+int HttpServer::discard_req_body_cb(void *ctx, int is_end_stream) {
+    if(!is_end_stream) {
+        h2o_req_t* req = static_cast<h2o_req_t*>(ctx);
+        req->proceed_req(req, nullptr);
+    }
+
     return 0;
 }
 
