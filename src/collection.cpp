@@ -233,15 +233,14 @@ inline bool is_supported_async_reference_backfill_value(const nlohmann::json& va
     return value.is_number_integer() || value.is_string();
 }
 
-// Returns the value that replaces `helper_value`, one value of an array reference helper field, when the document it
-// references is deleted. An object array reference helper value is an `[object_index, seq_id]` pair, so the object
-// index is kept. The sentinel is unsigned, since object array reference helper values are validated as unsigned.
-inline nlohmann::json get_reference_helper_sentinel(const nlohmann::json& helper_value) {
-    const uint32_t sentinel_value = Join::reference_helper_sentinel_value;
+// Returns the value that replaces `helper_value`, one value of an array reference helper field, so that it references
+// `seq_id`. An object array reference helper value is an `[object_index, seq_id]` pair, so the object index is kept.
+// The value is unsigned, since object array reference helper values are validated as unsigned.
+inline nlohmann::json get_reference_helper_value(const nlohmann::json& helper_value, const uint32_t seq_id) {
     if (helper_value.is_array() && helper_value.size() == 2) {
-        return nlohmann::json::array({helper_value[0], sentinel_value});
+        return nlohmann::json::array({helper_value[0], seq_id});
     }
-    return sentinel_value;
+    return seq_id;
 }
 
 Option<bool> append_async_reference_backfill_filter_value(const std::string& referenced_field_name,
@@ -352,7 +351,8 @@ Option<bool> Collection::update_async_references_with_lock(const std::string& re
 
                 should_update = true;
                 // Set reference helper field to `ref_seq_id` at the index corresponding to where reference field has value.
-                update_document[reference_helper_field_name][j] = ref_seq_id;
+                update_document[reference_helper_field_name][j] =
+                        get_reference_helper_value(existing_document[reference_helper_field_name][j], ref_seq_id);
             }
 
             if (should_update) {
@@ -477,7 +477,7 @@ Option<bool> Collection::stage_async_reference_update(Collection* referencing_co
             }
 
             should_update = true;
-            helper_field[j] = ref_seq_id;
+            helper_field[j] = get_reference_helper_value(helper_field[j], ref_seq_id);
         }
 
         if (!should_update) {
@@ -11003,7 +11003,8 @@ void Collection::cascade_remove(const std::vector<index_record>& records, const 
                             if (!cascade_delete) {
                                 update_document[field_name] += ref_value;
                                 update_document[ref_helper_field_name] +=
-                                        get_reference_helper_sentinel(existing_document[ref_helper_field_name][j]);
+                                        get_reference_helper_value(existing_document[ref_helper_field_name][j],
+                                                                   Join::reference_helper_sentinel_value);
                             }
                             continue;
                         }
@@ -11037,7 +11038,8 @@ void Collection::cascade_remove(const std::vector<index_record>& records, const 
                             // The field is an array, so its reference helper field stays an array.
                             update_document[ref_helper_field_name] = nlohmann::json::array();
                             update_document[ref_helper_field_name] +=
-                                    get_reference_helper_sentinel(existing_document[ref_helper_field_name][0]);
+                                    get_reference_helper_value(existing_document[ref_helper_field_name][0],
+                                                               Join::reference_helper_sentinel_value);
                         }
 
                         index_record record(update_index++, seq_id, update_document, index_operation_t::UPDATE,

@@ -6733,6 +6733,98 @@ TEST_F(CollectionJoinTest, CascadeDeleteOption) {
     ASSERT_EQ("c_1", res_obj["hits"][0]["document"]["coll_c"][1]["id"]);
 }
 
+TEST_F(CollectionJoinTest, ObjectArrayAsyncReferenceIsLinkedAgain) {
+    auto schema_json =
+            R"({
+                "name": "publications",
+                "fields": [
+                    {"name": "publication_id", "type": "int64"},
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto publications = collection_create_op.get();
+    ASSERT_TRUE(publications->add(R"({"id": "p2", "publication_id": 2, "name": "Two"})").ok());
+    ASSERT_TRUE(publications->add(R"({"id": "p3", "publication_id": 3, "name": "Three"})").ok());
+
+    schema_json =
+            R"({
+                "name": "articles",
+                "enable_nested_fields": true,
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "publication", "type": "object[]", "optional": true},
+                    {"name": "publication.id", "type": "int64[]", "optional": true,
+                        "reference": "publications.publication_id", "async_reference": true, "cascade_delete": false}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto articles = collection_create_op.get();
+    ASSERT_TRUE(articles->add(R"({"id": "a1", "title": "Two publications",
+                                  "publication": [{"id": 2}, {"id": 3}]})").ok());
+
+    // The reference to the deleted document is set to the sentinel value, and the object index is kept.
+    ASSERT_TRUE(publications->remove("p2").ok());
+    auto doc = articles->get("a1").get();
+    ASSERT_EQ(R"([[0, 4294967295], [1, 1]])"_json, doc["publication.id_sequence_id"]);
+
+    // A new document with the referenced value is linked again, and the other object keeps its reference.
+    ASSERT_TRUE(publications->add(R"({"id": "p2_new", "publication_id": 2, "name": "Two again"})").ok());
+
+    auto check_references = [&]() {
+        std::map<std::string, std::string> req_params = {
+                {"collection", "articles"},
+                {"q", "*"},
+                {"include_fields", "$publications(name)"}
+        };
+        nlohmann::json embedded_params;
+        std::string json_res;
+        auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+        ASSERT_TRUE(search_op.ok());
+
+        auto res_obj = nlohmann::json::parse(json_res);
+        ASSERT_EQ(1, res_obj["found"].get<size_t>());
+        auto hit_doc = res_obj["hits"][0]["document"];
+        ASSERT_EQ("a1", hit_doc["id"]);
+        ASSERT_EQ(2, hit_doc["publication"].size());
+        ASSERT_EQ("Two again", hit_doc["publication"][0]["publications"]["name"]);
+        ASSERT_EQ("Three", hit_doc["publication"][1]["publications"]["name"]);
+
+        for (const auto& filter: {"$publications(name:=`Two again`)", "$publications(name:=Three)"}) {
+            req_params = {
+                    {"collection", "articles"},
+                    {"q", "*"},
+                    {"filter_by", filter}
+            };
+            json_res.clear();
+            search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+            ASSERT_TRUE(search_op.ok());
+            res_obj = nlohmann::json::parse(json_res);
+            ASSERT_EQ(1, res_obj["found"].get<size_t>());
+            ASSERT_EQ("a1", res_obj["hits"][0]["document"]["id"]);
+        }
+
+        auto stored_doc = collectionManager.get_collection_unsafe("articles")->get("a1").get();
+        ASSERT_EQ(R"([[0, 2], [1, 1]])"_json, stored_doc["publication.id_sequence_id"]);
+    };
+    ASSERT_NO_FATAL_FAILURE(check_references());
+
+    //emulate restart
+    collectionManager.dispose();
+    delete store;
+
+    store = new Store(state_dir_path);
+    collectionManager.init(store, 1.0, "auth_key", quit);
+    auto load_op = collectionManager.load(8, 1000);
+    ASSERT_TRUE(load_op.ok());
+
+    ASSERT_NO_FATAL_FAILURE(check_references());
+}
+
 TEST_F(CollectionJoinTest, CascadeDeleteDoesNotHoldParentWhileWaitingForReferencingCollection) {
     auto parent_schema = R"({
         "name": "DeadlockParents",
