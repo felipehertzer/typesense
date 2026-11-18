@@ -15,6 +15,7 @@
 #include <string_utils.h>
 #include <thread>
 #include <filesystem>
+#include <unicode/utf8.h>
 
 namespace braft {
     DECLARE_int32(raft_do_snapshot_min_index_gap);
@@ -322,6 +323,34 @@ Option<bool> ReplicationState::handle_gzip(const std::shared_ptr<http_req>& requ
     return Option<bool>(true);
 }
 
+void ReplicationState::hold_back_split_char(const std::shared_ptr<http_req>& request) {
+    if(request->is_binary_body) {
+        // `to_json()` sends a binary body as base64
+        return;
+    }
+
+    if(!request->split_char_bytes.empty()) {
+        request->body.insert(0, request->split_char_bytes);
+        request->split_char_bytes.clear();
+    }
+
+    if(request->last_chunk_aggregate) {
+        return;
+    }
+
+    // an incomplete UTF-8 sequence is at most 3 bytes long
+    const int32_t tail_len = std::min<size_t>(3, request->body.size());
+    const auto* tail = reinterpret_cast<const uint8_t*>(request->body.data() + request->body.size() - tail_len);
+    int32_t complete_len = tail_len;
+    U8_TRUNCATE_IF_INCOMPLETE(tail, 0, complete_len);
+
+    if(complete_len < tail_len) {
+        const size_t split_pos = request->body.size() - (tail_len - complete_len);
+        request->split_char_bytes = request->body.substr(split_pos);
+        request->body.resize(split_pos);
+    }
+}
+
 void ReplicationState::write(const std::shared_ptr<http_req>& request, const std::shared_ptr<http_res>& response) {
     if(shutting_down) {
         //LOG(INFO) << "write(), force shutdown";
@@ -388,6 +417,9 @@ void ReplicationState::write(const std::shared_ptr<http_req>& request, const std
             return message_dispatcher->send_message(HttpServer::STREAM_RESPONSE_MESSAGE, req_res);
         }
     }
+
+    // A streamed body is cut into chunks at arbitrary bytes, but `to_json()` drops bytes that are not valid UTF-8.
+    hold_back_split_char(request);
 
     // Serialize request to replicated WAL so that all the nodes in the group receive it as well.
     // NOTE: actual write must be done only on the `on_apply` method to maintain consistency.

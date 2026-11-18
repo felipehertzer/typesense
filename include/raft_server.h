@@ -264,6 +264,9 @@ public:
 
     static Option<bool> handle_gzip(const std::shared_ptr<http_req>& request);
 
+    // Moves a UTF-8 character that is cut by the end of a streamed body chunk to the start of the next chunk.
+    static void hold_back_split_char(const std::shared_ptr<http_req>& request);
+
     void decr_pending_writes();
 
 private:

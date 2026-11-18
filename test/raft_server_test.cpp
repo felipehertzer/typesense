@@ -221,6 +221,84 @@ TEST(RaftServerTest, RejectsTruncatedGzipStreamWhenLastChunkIsEmpty) {
     ASSERT_FALSE(req->zstream_initialized);
 }
 
+namespace {
+    // Serializes one chunk of a streamed body the way ReplicationState::write() does and returns the body that
+    // the raft log (and the batched indexer's store) gives back for it.
+    std::string replicate_chunk(const std::shared_ptr<http_req>& req, const bool gzip) {
+        if(gzip) {
+            EXPECT_TRUE(ReplicationState::handle_gzip(req).ok());
+        }
+        ReplicationState::hold_back_split_char(req);
+        auto replica = std::make_shared<http_req>();
+        replica->load_from_json(req->to_json());
+        // like BatchedIndexer::enqueue() after a chunk that is not the last one
+        req->body = "";
+        return replica->body;
+    }
+}
+
+TEST(RaftServerTest, KeepsCharactersSplitAcrossBodyChunks) {
+    // 2, 3 and 4 byte characters
+    const std::string body = "{\"id\": \"1\", \"text\": \"aé‘😀b\"}\n";
+
+    for(size_t split = 1; split < body.size(); split++) {
+        auto req = std::make_shared<http_req>();
+        req->start_ts = 1;
+
+        req->body = body.substr(0, split);
+        req->last_chunk_aggregate = false;
+        std::string replicated = replicate_chunk(req, false);
+
+        req->body = body.substr(split);
+        req->last_chunk_aggregate = true;
+        replicated += replicate_chunk(req, false);
+
+        ASSERT_EQ(body, replicated) << "chunk ends at byte " << split;
+        ASSERT_TRUE(req->split_char_bytes.empty());
+    }
+}
+
+TEST(RaftServerTest, KeepsCharactersSplitAcrossGzipBodyChunks) {
+    std::string body;
+    for(size_t i = 0; i < 20000; i++) {
+        body += "{\"id\": \"" + std::to_string(i) + "\", \"text\": \"aé‘😀b\"}\n";
+    }
+
+    std::string compressed;
+    ASSERT_NO_FATAL_FAILURE(gzip_compress(body, compressed));
+
+    auto req = std::make_shared<http_req>();
+    req->start_ts = 1;
+    std::string replicated;
+    size_t chunks_ending_inside_a_char = 0;
+    const size_t chunk_size = 101;
+
+    for(size_t offset = 0; offset < compressed.size(); offset += chunk_size) {
+        req->body = compressed.substr(offset, chunk_size);
+        req->last_chunk_aggregate = (offset + chunk_size >= compressed.size());
+        replicated += replicate_chunk(req, true);
+        chunks_ending_inside_a_char += !req->split_char_bytes.empty();
+    }
+
+    ASSERT_EQ(body.size(), replicated.size());
+    ASSERT_TRUE(body == replicated);
+    // the inflated chunks did end inside characters
+    ASSERT_GT(chunks_ending_inside_a_char, 0);
+}
+
+TEST(RaftServerTest, KeepsBinaryBodyChunksAsTheyAre) {
+    const std::string body = "\x1f\x8b\xe2\x80\x98\xe2\x80";
+
+    auto req = std::make_shared<http_req>();
+    req->start_ts = 1;
+    req->is_binary_body = true;
+    req->body = body;
+    req->last_chunk_aggregate = false;
+
+    ASSERT_EQ(body, replicate_chunk(req, false));
+    ASSERT_TRUE(req->split_char_bytes.empty());
+}
+
 TEST(RaftServerTest, SnapshotLoadGateBlocksReadinessAndCatchupRefresh) {
     auto& config = Config::get_instance();
     ReplicationState replication_state(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false,
