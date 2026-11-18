@@ -4533,6 +4533,79 @@ TEST_F(CoreAPIUtilsTest, RemoveDocumentsWithReturnValues) {
     collectionManager.drop_collection("coll1");
 }
 
+TEST_F(CoreAPIUtilsTest, RemoveDocumentsByFilterAfterAsyncReferenceIsDeleted) {
+    auto schema_json =
+            R"({
+                "name": "del_filter_publications",
+                "fields": [
+                    {"name": "publication_id", "type": "int64"},
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto publications = collection_create_op.get();
+    ASSERT_TRUE(publications->add(R"({"id": "p1", "publication_id": 1, "name": "One"})").ok());
+
+    schema_json =
+            R"({
+                "name": "del_filter_articles",
+                "enable_nested_fields": true,
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "start_date", "type": "int64"},
+                    {"name": "publication", "type": "object[]", "optional": true},
+                    {"name": "publication.id", "type": "int64[]", "optional": true,
+                        "reference": "del_filter_publications.publication_id", "async_reference": true,
+                        "cascade_delete": false}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto articles = collection_create_op.get();
+    ASSERT_TRUE(articles->add(R"({"id": "a1", "title": "Old one", "start_date": 100})").ok());
+    ASSERT_TRUE(articles->add(R"({"id": "a2", "title": "Old two", "start_date": 200,
+                                  "publication": [{"id": 1}]})").ok());
+    ASSERT_TRUE(articles->add(R"({"id": "a3", "title": "Old three", "start_date": 300})").ok());
+    ASSERT_TRUE(articles->add(R"({"id": "a4", "title": "New", "start_date": 1000})").ok());
+
+    // `a2` keeps referencing the deleted publication, and the delete by filter must still remove it with the others.
+    ASSERT_TRUE(publications->remove("p1").ok());
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+    req->params["collection"] = "del_filter_articles";
+    req->params["filter_by"] = "start_date:<500";
+    req->params["batch_size"] = "100";
+    ASSERT_TRUE(del_remove_documents(req, res));
+    ASSERT_EQ(200, res->status_code);
+    ASSERT_EQ(3, nlohmann::json::parse(res->body)["num_deleted"].get<size_t>());
+
+    ASSERT_EQ(1, articles->get_num_documents());
+    for (const auto& id: {"a1", "a2", "a3"}) {
+        auto get_op = articles->get(id);
+        ASSERT_FALSE(get_op.ok());
+        ASSERT_EQ(404, get_op.code());
+    }
+    ASSERT_TRUE(articles->get("a4").ok());
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", "del_filter_articles"},
+            {"q", "*"},
+            {"filter_by", "start_date:<500"}
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+    ASSERT_EQ(0, nlohmann::json::parse(json_res)["found"].get<size_t>());
+
+    collectionManager.drop_collection("del_filter_articles");
+    collectionManager.drop_collection("del_filter_publications");
+}
+
 TEST_F(CoreAPIUtilsTest, CurlVersionSupportsOnlyHTTP1) {
     ASSERT_FALSE(HttpServer::curl_only_http1(R"(FME/2023.7.48.23764  libcurl/8.4.0 (OpenSSL/3.0.11)
                     Schannel zlib/1.2.13 WinIDN libssh2/1.11.0 nghttp2/1.44.0)"));
