@@ -3696,6 +3696,157 @@ TEST_F(CoreAPIUtilsTest, DocumentGetIncludeExcludeReferenceFields) {
     ASSERT_TRUE(resp["authors"].contains("id"));
 }
 
+TEST_F(CoreAPIUtilsTest, DeletedAsyncReferenceKeepsReferencingDocument) {
+    auto schema_json =
+            R"({
+                "name": "async_ref_publications",
+                "fields": [
+                    {"name": "publication_id", "type": "int64"},
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto publications = collection_create_op.get();
+    ASSERT_TRUE(publications->add(R"({"id": "p1", "publication_id": 1, "name": "One"})").ok());
+    ASSERT_TRUE(publications->add(R"({"id": "p2", "publication_id": 2, "name": "Two"})").ok());
+
+    schema_json =
+            R"({
+                "name": "async_ref_sections",
+                "fields": [
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto sections = collection_create_op.get();
+    ASSERT_TRUE(sections->add(R"({"id": "s1", "name": "World"})").ok());
+    ASSERT_TRUE(sections->add(R"({"id": "s2", "name": "Sport"})").ok());
+
+    schema_json =
+            R"({
+                "name": "async_ref_articles",
+                "enable_nested_fields": true,
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "publication", "type": "object[]", "optional": true},
+                    {"name": "publication.id", "type": "int64[]", "optional": true,
+                        "reference": "async_ref_publications.publication_id", "async_reference": true,
+                        "cascade_delete": false},
+                    {"name": "section_ids", "type": "string[]", "optional": true,
+                        "reference": "async_ref_sections.id", "async_reference": true, "cascade_delete": false}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto articles = collection_create_op.get();
+    ASSERT_TRUE(articles->add(R"({"id": "a1", "title": "One reference", "publication": [{"id": 1}],
+                                  "section_ids": ["s1"]})").ok());
+    ASSERT_TRUE(articles->add(R"({"id": "a2", "title": "Two references", "publication": [{"id": 1}, {"id": 2}],
+                                  "section_ids": ["s1", "s2"]})").ok());
+
+    // With `cascade_delete: false`, deleting a referenced document keeps the documents that reference it.
+    ASSERT_TRUE(publications->remove("p1").ok());
+    ASSERT_TRUE(sections->remove("s1").ok());
+
+    std::shared_ptr<http_req> req = std::make_shared<http_req>();
+    std::shared_ptr<http_res> res = std::make_shared<http_res>(nullptr);
+    req->params["collection"] = "async_ref_articles";
+    req->params["id"] = "a1";
+    ASSERT_TRUE(get_fetch_document(req, res));
+    auto resp = nlohmann::json::parse(res->body);
+    ASSERT_EQ("a1", resp["id"]);
+    ASSERT_EQ("One reference", resp["title"]);
+    ASSERT_EQ(1, resp["publication"].size());
+    ASSERT_EQ(1, resp["publication"][0]["id"]);
+    ASSERT_EQ(1, resp["section_ids"].size());
+    ASSERT_EQ("s1", resp["section_ids"][0]);
+
+    req->params["id"] = "a2";
+    req->params["include_fields"] = "$async_ref_publications(name)";
+    ASSERT_TRUE(get_fetch_document(req, res));
+    resp = nlohmann::json::parse(res->body);
+    ASSERT_EQ("a2", resp["id"]);
+    ASSERT_EQ(2, resp["publication"].size());
+    ASSERT_EQ(0, resp["publication"][0].count("async_ref_publications"));
+    ASSERT_EQ("Two", resp["publication"][1]["async_ref_publications"]["name"]);
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", "async_ref_articles"},
+            {"q", "*"},
+            {"include_fields", "$async_ref_publications(name), $async_ref_sections(name)"}
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    auto res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(2, res_obj["found"].get<size_t>());
+    ASSERT_EQ(2, res_obj["hits"].size());
+    std::map<std::string, nlohmann::json> hits;
+    for (const auto& hit: res_obj["hits"]) {
+        ASSERT_EQ(1, hit["document"].count("id"));
+        hits[hit["document"]["id"].get<std::string>()] = hit["document"];
+    }
+
+    ASSERT_EQ(1, hits.count("a1"));
+    ASSERT_EQ("One reference", hits["a1"]["title"]);
+    ASSERT_EQ(1, hits["a1"]["publication"].size());
+    ASSERT_EQ(0, hits["a1"]["publication"][0].count("async_ref_publications"));
+    ASSERT_EQ(0, hits["a1"].count("async_ref_sections"));
+
+    ASSERT_EQ(1, hits.count("a2"));
+    ASSERT_EQ("Two references", hits["a2"]["title"]);
+    ASSERT_EQ(2, hits["a2"]["publication"].size());
+    ASSERT_EQ(0, hits["a2"]["publication"][0].count("async_ref_publications"));
+    ASSERT_EQ("Two", hits["a2"]["publication"][1]["async_ref_publications"]["name"]);
+    ASSERT_EQ(1, hits["a2"]["async_ref_sections"].size());
+    ASSERT_EQ("Sport", hits["a2"]["async_ref_sections"][0]["name"]);
+
+    req = std::make_shared<http_req>();
+    res = std::make_shared<http_res>(nullptr);
+    req->params["collection"] = "async_ref_articles";
+    ASSERT_TRUE(get_export_documents(req, res));
+
+    std::vector<std::string> res_strs;
+    StringUtils::split(res->body, res_strs, "\n");
+    ASSERT_EQ(2, res_strs.size());
+    std::set<std::string> exported_ids;
+    for (const auto& line: res_strs) {
+        auto exported = nlohmann::json::parse(line);
+        ASSERT_EQ(1, exported.count("id"));
+        ASSERT_EQ(1, exported.count("title"));
+        ASSERT_EQ(1, exported.count("publication"));
+        exported_ids.insert(exported["id"].get<std::string>());
+    }
+    ASSERT_EQ(std::set<std::string>({"a1", "a2"}), exported_ids);
+
+    delete dynamic_cast<export_state_t*>(req->data);
+    req->data = nullptr;
+
+    // Only the references to the deleted documents are set to the sentinel value.
+    auto doc = articles->get("a1").get();
+    ASSERT_EQ(1, doc["publication.id_sequence_id"].size());
+    ASSERT_EQ(0, doc["publication.id_sequence_id"][0][0]);
+    ASSERT_EQ(Join::reference_helper_sentinel_value, doc["publication.id_sequence_id"][0][1]);
+    ASSERT_EQ(1, doc["section_ids_sequence_id"].size());
+    ASSERT_EQ(Join::reference_helper_sentinel_value, doc["section_ids_sequence_id"][0]);
+
+    doc = articles->get("a2").get();
+    ASSERT_EQ(2, doc["publication.id_sequence_id"].size());
+    ASSERT_EQ(0, doc["publication.id_sequence_id"][0][0]);
+    ASSERT_EQ(Join::reference_helper_sentinel_value, doc["publication.id_sequence_id"][0][1]);
+    ASSERT_EQ(1, doc["publication.id_sequence_id"][1][0]);
+    ASSERT_EQ(1, doc["publication.id_sequence_id"][1][1]);
+    ASSERT_EQ(2, doc["section_ids_sequence_id"].size());
+    ASSERT_EQ(Join::reference_helper_sentinel_value, doc["section_ids_sequence_id"][0]);
+    ASSERT_EQ(1, doc["section_ids_sequence_id"][1]);
+}
+
 TEST_F(CoreAPIUtilsTest, JoinPolicyAppliesToExportAndDocumentGet) {
     auto authors_schema = R"({
         "name": "endpoint_policy_authors",

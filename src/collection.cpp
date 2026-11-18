@@ -233,6 +233,17 @@ inline bool is_supported_async_reference_backfill_value(const nlohmann::json& va
     return value.is_number_integer() || value.is_string();
 }
 
+// Returns the value that replaces `helper_value`, one value of an array reference helper field, when the document it
+// references is deleted. An object array reference helper value is an `[object_index, seq_id]` pair, so the object
+// index is kept. The sentinel is unsigned, since object array reference helper values are validated as unsigned.
+inline nlohmann::json get_reference_helper_sentinel(const nlohmann::json& helper_value) {
+    const uint32_t sentinel_value = Join::reference_helper_sentinel_value;
+    if (helper_value.is_array() && helper_value.size() == 2) {
+        return nlohmann::json::array({helper_value[0], sentinel_value});
+    }
+    return sentinel_value;
+}
+
 Option<bool> append_async_reference_backfill_filter_value(const std::string& referenced_field_name,
                                                           const std::string& referenced_field_type,
                                                           const nlohmann::json& value,
@@ -10991,7 +11002,8 @@ void Collection::cascade_remove(const std::vector<index_record>& records, const 
 
                             if (!cascade_delete) {
                                 update_document[field_name] += ref_value;
-                                update_document[ref_helper_field_name] += Join::reference_helper_sentinel_value;
+                                update_document[ref_helper_field_name] +=
+                                        get_reference_helper_sentinel(existing_document[ref_helper_field_name][j]);
                             }
                             continue;
                         }
@@ -11022,7 +11034,10 @@ void Collection::cascade_remove(const std::vector<index_record>& records, const 
                         if (cascade_delete) {
                             update_document[field_name] = nullptr;
                         } else {
-                            update_document[ref_helper_field_name] = Join::reference_helper_sentinel_value;
+                            // The field is an array, so its reference helper field stays an array.
+                            update_document[ref_helper_field_name] = nlohmann::json::array();
+                            update_document[ref_helper_field_name] +=
+                                    get_reference_helper_sentinel(existing_document[ref_helper_field_name][0]);
                         }
 
                         index_record record(update_index++, seq_id, update_document, index_operation_t::UPDATE,
@@ -11053,6 +11068,13 @@ void Collection::cascade_remove(const std::vector<index_record>& records, const 
                                                        search_schema, embedding_fields, fallback_field_type,
                                                        token_separators, symbols_to_index, dummy_set);
         for (auto& update_record: update_records) {
+            // A record that failed validation has no `new_doc`, and the stored document must stay as it is.
+            if (!update_record.indexed.ok()) {
+                LOG(ERROR) << "`" << name << "` collection: Could not update the references of doc `" <<
+                           update_record.doc["id"].get<std::string>() << "`: " << update_record.indexed.error();
+                continue;
+            }
+
             remove_flat_fields(update_record.new_doc);
             for(auto& f: fields) {
                 if(!f.store) {
