@@ -6324,6 +6324,223 @@ TEST_F(CollectionVectorTest, UpdateEmbeddings) {
     }
 }
 
+TEST_F(CollectionVectorTest, UpdateEmbedsTheMergedDocument) {
+    nlohmann::json schema = R"({
+        "name": "objects",
+        "fields": [
+            {"name": "title", "type": "string"},
+            {"name": "summary", "type": "string", "optional": true},
+            {"name": "tags", "type": "string[]", "optional": true},
+            {"name": "embedding", "type":"float[]", "embed":{"from": ["title", "summary", "tags"],
+                "model_config": {"model_name": "ts/e5-small"}}}
+        ]
+    })"_json;
+
+    EmbedderManager::set_model_dir(test_models_dir());
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll = op.get();
+
+    // the embedding that an insert of `doc` gets
+    size_t num_inserted = 0;
+    auto inserted_embedding = [&](nlohmann::json doc) {
+        doc["id"] = "inserted_" + std::to_string(num_inserted++);
+        auto add_op = coll->add(doc.dump());
+        if(!add_op.ok()) {
+            ADD_FAILURE() << add_op.error();
+            return std::vector<float>();
+        }
+        return add_op.get()["embedding"].get<std::vector<float>>();
+    };
+
+    // writes `doc` to "a" and compares the embedding it answers and stores with an insert of `merged_doc`
+    auto write_and_compare = [&](const nlohmann::json& doc, const index_operation_t operation,
+                                 const nlohmann::json& merged_doc) {
+        auto write_op = coll->add(doc.dump(), operation);
+        ASSERT_TRUE(write_op.ok()) << write_op.error();
+
+        auto get_op = coll->get("a");
+        ASSERT_TRUE(get_op.ok());
+
+        auto expected = inserted_embedding(merged_doc);
+        ASSERT_EQ(384, expected.size());
+
+        std::vector<nlohmann::json> written_docs = {write_op.get(), get_op.get()};
+        for(const auto& written_doc: written_docs) {
+            ASSERT_TRUE(written_doc.contains("embedding"));
+            auto actual = written_doc["embedding"].get<std::vector<float>>();
+            ASSERT_EQ(expected.size(), actual.size());
+            for(size_t i = 0; i < expected.size(); i++) {
+                ASSERT_NEAR(expected[i], actual[i], 0.0001) << doc.dump() << ", element " << i;
+            }
+        }
+    };
+
+    auto add_op = coll->add(R"({"id": "a", "title": "Uranium stocks rally on supply fears"})"_json.dump());
+    ASSERT_TRUE(add_op.ok());
+
+    // `summary` and `tags` are in neither the stored nor the updated document
+    write_and_compare(R"({"id": "a", "title": "Uranium stocks slump"})"_json, UPDATE,
+                      R"({"title": "Uranium stocks slump"})"_json);
+
+    write_and_compare(R"({"id": "a", "tags": ["energy", "mining"]})"_json, EMPLACE,
+                      R"({"title": "Uranium stocks slump", "tags": ["energy", "mining"]})"_json);
+
+    // `from` fields that an update or an upsert drops
+    write_and_compare(R"({"id": "a", "summary": "Prices fall", "tags": null})"_json, UPDATE,
+                      R"({"title": "Uranium stocks slump", "summary": "Prices fall"})"_json);
+
+    write_and_compare(R"({"id": "a", "title": "Uranium stocks slump"})"_json, UPSERT,
+                      R"({"title": "Uranium stocks slump"})"_json);
+}
+
+TEST_F(CollectionVectorTest, UpdateThatDropsEveryEmbedFromField) {
+    EmbedderManager::set_model_dir(test_models_dir());
+
+    // as on an insert without any of the `from` fields, an optional embedding is left out ...
+    nlohmann::json schema = R"({
+        "name": "optional_embedding",
+        "fields": [
+            {"name": "summary", "type": "string", "optional": true},
+            {"name": "tags", "type": "string[]", "optional": true},
+            {"name": "embedding", "type":"float[]", "optional": true, "embed":{"from": ["summary", "tags"],
+                "model_config": {"model_name": "ts/e5-small"}}}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll = op.get();
+
+    auto num_found = [&]() {
+        return coll->search("uranium", {"embedding"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {true}).get()["found"]
+                   .get<size_t>();
+    };
+
+    auto add_op = coll->add(R"({"id": "0", "summary": "Uranium stocks rally"})"_json.dump());
+    ASSERT_TRUE(add_op.ok());
+    ASSERT_EQ(384, add_op.get()["embedding"].size());
+    ASSERT_EQ(1, num_found());
+
+    auto update_op = coll->add(R"({"id": "0", "summary": null})"_json.dump(), UPDATE);
+    ASSERT_TRUE(update_op.ok()) << update_op.error();
+    ASSERT_FALSE(update_op.get().contains("embedding"));
+    ASSERT_FALSE(coll->get("0").get().contains("embedding"));
+    ASSERT_EQ(0, num_found());
+
+    update_op = coll->add(R"({"id": "0", "tags": ["uranium", "energy"]})"_json.dump(), UPDATE);
+    ASSERT_TRUE(update_op.ok()) << update_op.error();
+    ASSERT_EQ(384, coll->get("0").get()["embedding"].size());
+    ASSERT_EQ(1, num_found());
+
+    // ... and a required one is an error
+    schema = R"({
+        "name": "required_embedding",
+        "fields": [
+            {"name": "summary", "type": "string", "optional": true},
+            {"name": "tags", "type": "string[]", "optional": true},
+            {"name": "embedding", "type":"float[]", "embed":{"from": ["summary", "tags"],
+                "model_config": {"model_name": "ts/e5-small"}}}
+        ]
+    })"_json;
+
+    op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    coll = op.get();
+
+    add_op = coll->add(R"({"id": "0", "summary": "Uranium stocks rally"})"_json.dump());
+    ASSERT_TRUE(add_op.ok());
+    auto embedding = add_op.get()["embedding"];
+
+    const std::string error = "No valid fields found to create embedding for `embedding`, please provide at least "
+                              "one valid field or make the embedding field optional.";
+
+    update_op = coll->add(R"({"id": "0", "summary": null})"_json.dump(), UPDATE);
+    ASSERT_FALSE(update_op.ok());
+    ASSERT_EQ(error, update_op.error());
+
+    update_op = coll->add(R"({"id": "0"})"_json.dump(), UPSERT);
+    ASSERT_FALSE(update_op.ok());
+    ASSERT_EQ(error, update_op.error());
+
+    auto stored_doc = coll->get("0").get();
+    ASSERT_EQ("Uranium stocks rally", stored_doc["summary"]);
+    ASSERT_EQ(embedding, stored_doc["embedding"]);
+    ASSERT_EQ(1, num_found());
+}
+
+TEST_F(CollectionVectorTest, UpdateThatDropsVectorRemovesItFromVectorSearch) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "fields": [
+            {"name": "points", "type": "int32"},
+            {"name": "vec", "type": "float[]", "num_dim": 2, "optional": true}
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll = op.get();
+
+    ASSERT_TRUE(coll->add(R"({"id": "0", "points": 0, "vec": [1.0, 0.0]})"_json.dump()).ok());
+    ASSERT_TRUE(coll->add(R"({"id": "1", "points": 1, "vec": [0.0, 1.0]})"_json.dump()).ok());
+
+    // ids found by the HNSW search and by the flat search
+    auto found_ids = [&](const bool flat_search) {
+        std::map<std::string, std::string> req_params = {
+                {"collection", "coll1"},
+                {"q", "*"},
+                {"vector_query", flat_search ? "vec:([1.0, 0.0], flat_search_cutoff: 100)" : "vec:([1.0, 0.0])"}
+        };
+        if(flat_search) {
+            req_params["filter_by"] = "points:>=0";
+        }
+
+        nlohmann::json embedded_params;
+        std::string json_res;
+        auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        std::vector<std::string> ids;
+        auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+        if(!search_op.ok()) {
+            ADD_FAILURE() << search_op.error();
+            return ids;
+        }
+        auto res = nlohmann::json::parse(json_res);
+        for(const auto& hit: res["hits"]) {
+            ids.push_back(hit["document"]["id"].get<std::string>());
+        }
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+
+    for(const bool flat_search: {false, true}) {
+        ASSERT_EQ(std::vector<std::string>({"0", "1"}), found_ids(flat_search));
+    }
+
+    auto write_op = coll->add(R"({"id": "0", "vec": null})"_json.dump(), UPDATE);
+    ASSERT_TRUE(write_op.ok()) << write_op.error();
+    for(const bool flat_search: {false, true}) {
+        ASSERT_EQ(std::vector<std::string>({"1"}), found_ids(flat_search));
+    }
+
+    write_op = coll->add(R"({"id": "1", "points": 1})"_json.dump(), UPSERT);
+    ASSERT_TRUE(write_op.ok()) << write_op.error();
+    for(const bool flat_search: {false, true}) {
+        ASSERT_EQ(std::vector<std::string>(), found_ids(flat_search));
+    }
+
+    // the vector can come back
+    write_op = coll->add(R"({"id": "0", "vec": [0.0, 1.0]})"_json.dump(), UPDATE);
+    ASSERT_TRUE(write_op.ok()) << write_op.error();
+    write_op = coll->add(R"({"id": "0", "vec": [1.0, 0.0]})"_json.dump(), UPDATE);
+    ASSERT_TRUE(write_op.ok()) << write_op.error();
+    for(const bool flat_search: {false, true}) {
+        ASSERT_EQ(std::vector<std::string>({"0"}), found_ids(flat_search));
+    }
+}
+
 
 TEST_F(CollectionVectorTest, TestRankFusionOrdering) {
     nlohmann::json schema = R"({

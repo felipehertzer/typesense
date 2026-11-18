@@ -613,28 +613,9 @@ void Index::validate_and_preprocess(Index *index,
                     LOG(INFO) << "index_rec.del_doc: " << index_rec.del_doc;
                 }*/
                 if(generate_embeddings) {
-                    for(auto& embedding_field : embedding_fields) {
-                        auto embed_from_vector = embedding_field.embed[fields::from].get<std::vector<std::string>>();
-                        for(auto& embed_from: embed_from_vector) {
-                            if(index_rec.doc.count(embed_from) != 0) {
-                                
-                                for(auto& embed_from: embed_from_vector) {
-                                    if(index_rec.doc.count(embed_from) == 0) {
-                                        // copy the value from old doc to new doc if it is not present in the new doc
-                                        if(index_rec.old_doc.count(embed_from) == 0) {
-                                            index_rec.index_failure(400, "One or more of the fields to embed is missing in the both the old and new documents");
-                                            break;
-                                        }
-                                        index_rec.doc[embed_from] = index_rec.old_doc[embed_from];
-                                    }
-                                }
-                                if(index_rec.indexed.ok()) {
-                                    records_to_embed.push_back(&index_rec);
-                                }
-                                break;
-                            }
-                        }
-                    }
+                    // `batch_embed_fields()` embeds an update from the merged document, for each embedding field
+                    // whose `from` fields the update changes or drops
+                    records_to_embed.push_back(&index_rec);
                 }
             } else {
                 if(generate_embeddings) {
@@ -711,6 +692,7 @@ size_t Index::batch_memory_index(Index *index,
 
         if(index_rec.is_update) {
             index->remove(index_rec.seq_id, index_rec.del_doc, {}, index_rec.is_update);
+            index->remove_dropped_vectors(index_rec.seq_id, index_rec.del_doc, index_rec.doc);
         } else if(index_rec.indexed.ok()) {
             num_indexed++;
         }
@@ -7849,6 +7831,31 @@ Option<uint32_t> Index::remove(const uint32_t seq_id, nlohmann::json & document,
     return Option<uint32_t>(seq_id);
 }
 
+void Index::remove_dropped_vectors(const uint32_t seq_id, const nlohmann::json& del_doc,
+                                   const nlohmann::json& update_doc) {
+    // `remove()` keeps vectors on update, since indexing upserts the vector an update changes.
+    // A vector that the update drops is not upserted, so it is deleted here.
+    std::unique_lock lock(mutex);
+
+    for(auto it = del_doc.begin(); it != del_doc.end(); ++it) {
+        if(update_doc.contains(it.key())) {
+            continue;
+        }
+
+        auto vector_index_it = vector_index.find(it.key());
+        if(vector_index_it == vector_index.end()) {
+            continue;
+        }
+
+        try {
+            vector_index_it->second->vecdex->markDelete(seq_id);
+        } catch(const std::exception& e) {
+            LOG(WARNING) << "Error while removing vector of field `" << it.key() << "` from document, message: "
+                         << e.what();
+        }
+    }
+}
+
 void Index::tokenize_string_field(const nlohmann::json& document, const field& search_field,
                                   std::vector<std::string>& tokens, const std::string& locale,
                                   const std::vector<char>& symbols_to_index,
@@ -8507,6 +8514,22 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
                                const tsl::htrie_map<char, field>& embedding_fields,
                                const tsl::htrie_map<char, field> & search_schema, const size_t remote_embedding_batch_size,
                                const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries) {
+    // An update that drops every value an embedding is made from ends like an insert without them:
+    // an optional embedding is left out and a required one is an error.
+    const auto drop_embedding = [](index_record& record, const field& the_field) {
+        if(!the_field.optional) {
+            record.index_failure(400, "No valid fields found to create embedding for `" + the_field.name +
+                                      "`, please provide at least one valid field or make the embedding field optional.");
+            return;
+        }
+
+        auto old_embedding_it = record.old_doc.find(the_field.name);
+        if(old_embedding_it != record.old_doc.end()) {
+            record.del_doc[the_field.name] = *old_embedding_it;
+        }
+        record.new_doc.erase(the_field.name);
+    };
+
     for(const auto& field : embedding_fields) {
         std::vector<std::pair<index_record*, std::string>> values_to_embed_text, values_to_embed_image;
         std::vector<std::pair<index_record*, std::vector<std::string>>> values_to_embed_personalization;
@@ -8534,6 +8557,16 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
             }
 
             const auto& embed_from = field.embed[fields::from].get<std::vector<std::string>>();
+
+            // An update is embedded from the merged document (`new_doc`). `doc` holds the values the update adds
+            // or changes, and `del_doc` the ones it changes or drops: without either, the stored embedding holds.
+            if(record->is_update &&
+               std::none_of(embed_from.begin(), embed_from.end(), [&record](const std::string& field_name) {
+                   return record->doc.contains(field_name) || record->del_doc.contains(field_name);
+               })) {
+                continue;
+            }
+
             if (field.embed[fields::model_config].count(fields::personalization_type) > 0) {
                 const auto& embed_mapping = field.embed[fields::mapping].get<std::vector<std::string>>();
                 std::vector<std::string> value;
@@ -8558,9 +8591,14 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
                         value.push_back(value_str);
                     }
                 }
+                if(record->is_update && value.empty()) {
+                    drop_embedding(*record, field);
+                    continue;
+                }
                 values_to_embed_personalization.push_back(std::make_pair(record, value));
             } else {
                 std::string value = indexing_prefix;
+                bool has_image = false;
                 for(const auto& field_name : embed_from) {
                     auto field_it = search_schema.find(field_name);
                     auto doc_field_it = document->find(field_name);
@@ -8569,6 +8607,7 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
                     }
                     if(field_it.value().type == field_types::IMAGE) {
                         values_to_embed_image.push_back(std::make_pair(record, doc_field_it->get<std::string>()));
+                        has_image = true;
                         continue;
                     }
                     if(field_it.value().type == field_types::STRING) {
@@ -8581,6 +8620,8 @@ void Index::batch_embed_fields(std::vector<index_record*>& records,
                 }
                 if(value != indexing_prefix) {
                     values_to_embed_text.push_back(std::make_pair(record, value));
+                } else if(record->is_update && !has_image) {
+                    drop_embedding(*record, field);
                 }
             }
         }

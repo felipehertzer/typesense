@@ -876,6 +876,9 @@ public:
     Option<uint32_t> remove(const uint32_t seq_id, nlohmann::json & document,
                             const std::vector<field>& del_fields, const bool is_update);
 
+    void remove_dropped_vectors(const uint32_t seq_id, const nlohmann::json& del_doc,
+                                const nlohmann::json& update_doc);
+
     static void validate_and_preprocess(Index *index, std::vector<index_record>& iter_batch,
                                           const size_t batch_start_index, const size_t batch_size,
                                           const std::string & default_sorting_field,
