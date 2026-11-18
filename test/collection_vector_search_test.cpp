@@ -2810,6 +2810,106 @@ TEST_F(CollectionVectorTest, GroupByWithHybridSearchRejectsUnselectedPartialMiss
     ASSERT_EQ(Index::DEFAULT_TOPSTER_SIZE, res["facet_counts"][0]["counts"][0]["count"]);
 }
 
+TEST_F(CollectionVectorTest, GroupByWithHybridSearchReranksMatches) {
+    nlohmann::json schema = R"({
+        "name": "grouped_hybrid_rerank",
+        "fields": [
+            {"name": "title", "type": "string"},
+            {"name": "group", "type": "string", "facet": true},
+            {"name": "points", "type": "int32"},
+            {"name": "views", "type": "int32"},
+            {"name": "shares", "type": "int32"},
+            {"name": "vec", "type": "float[]", "num_dim": 2}
+        ]
+    })"_json;
+
+    auto create_op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(create_op.ok());
+    auto coll = create_op.get();
+
+    // "0" is the best keyword match and the farthest vector, "1" is second in both, and "2" is the nearest vector
+    // without a keyword match. The vector search keeps only "2" (k: 1): only the rerank ranks "0" and "1" by vector.
+    ASSERT_TRUE(coll->add(R"({
+        "id": "0", "title": "butter cake", "group": "g0", "points": 0, "views": 0, "shares": 0, "vec": [0.0, 1.0]
+    })"_json.dump()).ok());
+    ASSERT_TRUE(coll->add(R"({
+        "id": "1", "title": "butter toast", "group": "g1", "points": 1, "views": 1, "shares": 1, "vec": [0.6, 0.8]
+    })"_json.dump()).ok());
+    ASSERT_TRUE(coll->add(R"({
+        "id": "2", "title": "orange juice", "group": "g2", "points": 2, "views": 2, "shares": 2, "vec": [1.0, 0.0]
+    })"_json.dump()).ok());
+
+    // the hits in order, one per group when grouped
+    auto search = [&](const bool group_by, const bool rerank, const std::string& sort_by = "") {
+        std::map<std::string, std::string> req_params = {
+                {"collection", "grouped_hybrid_rerank"},
+                {"q", "butter cake"},
+                {"query_by", "title"},
+                {"drop_tokens_threshold", "10"},
+                {"vector_query", "vec:([1.0, 0.0], k: 1, alpha: 0.8)"},
+                {"rerank_hybrid_matches", rerank ? "true" : "false"}
+        };
+        if(group_by) {
+            req_params["group_by"] = "group";
+            req_params["group_limit"] = "1";
+        }
+        if(!sort_by.empty()) {
+            req_params["sort_by"] = sort_by;
+        }
+
+        nlohmann::json embedded_params;
+        std::string json_res;
+        const auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+        nlohmann::json hits = nlohmann::json::array();
+        auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+        if(!search_op.ok()) {
+            ADD_FAILURE() << search_op.error();
+            return hits;
+        }
+
+        auto res = nlohmann::json::parse(json_res);
+        if(!group_by) {
+            return res["hits"];
+        }
+        for(const auto& group: res["grouped_hits"]) {
+            EXPECT_EQ(1, group["hits"].size());
+            hits.push_back(group["hits"][0]);
+        }
+        return hits;
+    };
+
+    auto ids = [](const nlohmann::json& hits) {
+        std::vector<std::string> hit_ids;
+        for(const auto& hit: hits) {
+            hit_ids.push_back(hit["document"]["id"].get<std::string>());
+        }
+        return hit_ids;
+    };
+
+    // without the rerank, "0" and "1" only have their keyword rank
+    ASSERT_EQ(std::vector<std::string>({"2", "0", "1"}), ids(search(false, false)));
+    ASSERT_EQ(std::vector<std::string>({"2", "0", "1"}), ids(search(true, false)));
+
+    // with it, "1", second in both lists, gets ahead of "0", and grouping keeps every score
+    auto ungrouped_hits = search(false, true);
+    auto grouped_hits = search(true, true);
+    ASSERT_EQ(std::vector<std::string>({"2", "1", "0"}), ids(ungrouped_hits));
+    ASSERT_EQ(ids(ungrouped_hits), ids(grouped_hits));
+    for(size_t i = 0; i < ungrouped_hits.size(); i++) {
+        ASSERT_EQ(ungrouped_hits[i]["hybrid_search_info"], grouped_hits[i]["hybrid_search_info"]);
+        ASSERT_EQ(ungrouped_hits[i]["text_match"], grouped_hits[i]["text_match"]);
+        ASSERT_EQ(ungrouped_hits[i]["vector_distance"], grouped_hits[i]["vector_distance"]);
+    }
+
+    // three sort fields leave out the text match, which the rerank then leaves alone
+    for(const bool group_by: {false, true}) {
+        ASSERT_EQ(std::vector<std::string>({"2", "1", "0"}),
+                  ids(search(group_by, true, "points:desc,views:desc,shares:desc")));
+    }
+}
+
 TEST_F(CollectionVectorTest, HybridSearchReturnAllInfo) {
     auto schema_json =
             R"({

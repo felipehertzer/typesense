@@ -9237,18 +9237,32 @@ void Index::compute_aux_scores(Topster<KV>* topster, const std::vector<search_fi
         }
     };
 
+    // In the second pass of a group_by search the topster keeps the results in their groups, and its map is empty.
+    std::vector<KV*> result_kvs;
+    if(topster->distinct && !topster->is_group_by_first_pass) {
+        for(const auto& group_kvs: topster->group_kv_map) {
+            for(uint32_t i = 0; i < group_kvs.second->size; i++) {
+                result_kvs.push_back(group_kvs.second->getKV(i));
+            }
+        }
+    } else {
+        for(const auto& kv: topster->map) {
+            result_kvs.push_back(kv.second);
+        }
+    }
+
     std::vector<KV *> text_match_ids;
-    for (auto &kv: topster->map) {
-        if (kv.second->text_match_score == 0) {
+    for (auto kv: result_kvs) {
+        if (kv->text_match_score == 0) {
             //only found via vector distance, should compute text_match_score later
-            text_match_ids.push_back(kv.second);
-        } else if (kv.second->vector_distance == -1.0f) {
+            text_match_ids.push_back(kv);
+        } else if (kv->vector_distance == -1.0f) {
             //only found via text_match, should compute vector distance
             std::vector<float> values;
             auto &field_vector_index = vector_index.at(vector_query.field_name);
 
             try {
-                values = field_vector_index->vecdex->getDataByLabel<float>(kv.second->key);
+                values = field_vector_index->vecdex->getDataByLabel<float>(kv->key);
             } catch (...) {
                 // likely not found
                 continue;
@@ -9267,7 +9281,7 @@ void Index::compute_aux_scores(Topster<KV>* topster, const std::vector<search_fi
                                                                   &field_vector_index->num_dim);
             }
 
-            kv.second->vector_distance = dist;
+            kv->vector_distance = dist;
         }
     }
 
@@ -9275,17 +9289,13 @@ void Index::compute_aux_scores(Topster<KV>* topster, const std::vector<search_fi
         std::sort(text_match_ids.begin(), text_match_ids.end(), [&](const auto& kv1, const auto& kv2) {
             return kv1->key < kv2->key;
         });
-        compute_text_match_aux_score(text_match_ids, topster->map.size() - text_match_ids.size() + 1);
+        compute_text_match_aux_score(text_match_ids, result_kvs.size() - text_match_ids.size() + 1);
     }
 
     //rerank results
     std::unordered_map<int32_t, int32_t> semantic_seq_id_ranks;
     std::unordered_map<int32_t, int32_t> keyword_seq_id_ranks;
-    std::vector<KV*> kvs;
-
-    for(const auto& kv : topster->map) {
-        kvs.push_back(kv.second);
-    }
+    std::vector<KV*> kvs = result_kvs;
 
     // compute ranks as per keyword search first
     std::stable_sort(kvs.begin(), kvs.end(), [&](const auto& kv1, const auto& kv2) {
@@ -9306,9 +9316,14 @@ void Index::compute_aux_scores(Topster<KV>* topster, const std::vector<search_fi
     }
 
     //compute fusion_score
-    for(auto& kv : topster->map) {
-        auto seq_id = kv.second->key;
-        kv.second->scores[kv.second->match_score_index] = float_to_int64_t((1.0/keyword_seq_id_ranks[seq_id]) * (1.0 - vector_query.alpha) +
+    for(auto kv : result_kvs) {
+        if(kv->match_score_index < 0 || kv->match_score_index > 2) {
+            // the text match is not sorted on
+            continue;
+        }
+
+        auto seq_id = kv->key;
+        kv->scores[kv->match_score_index] = float_to_int64_t((1.0/keyword_seq_id_ranks[seq_id]) * (1.0 - vector_query.alpha) +
                                                             (1.0/semantic_seq_id_ranks[seq_id]) * vector_query.alpha);
     }
 }
