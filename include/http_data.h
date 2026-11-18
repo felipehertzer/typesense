@@ -306,6 +306,9 @@ struct http_req {
     z_stream zs;
     bool zstream_initialized = false;
 
+    // leading bytes of a multi-byte UTF-8 character that the previous chunk of a streamed body ended inside of
+    std::string split_char_bytes;
+
     // stores http lib related datastructures to avoid race conditions between indexing and http write threads
     stream_response_state_t res_state;
 
