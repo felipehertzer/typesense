@@ -107,6 +107,12 @@ Option<bool> Join::single_value_filter_query(nlohmann::json& document, const std
     return Option<bool>(true);
 }
 
+// An object array reference helper value is an `[object_index, seq_id]` pair. Both are unsigned, as the validator
+// expects them to be.
+static nlohmann::json object_array_reference_helper_value(const uint32_t object_index, const uint32_t seq_id) {
+    return nlohmann::json::array({object_index, seq_id});
+}
+
 Option<bool> Join::populate_reference_helper_fields(nlohmann::json& document,
                                                     const tsl::htrie_map<char, field>& schema,
                                                     const spp::sparse_hash_map<std::string, reference_info_t>& reference_fields,
@@ -161,7 +167,23 @@ Option<bool> Join::populate_reference_helper_fields(nlohmann::json& document,
         if (CollectionManager::get_instance().get_collection(reference_collection_name) == nullptr) {
             if (is_async_reference) {
                 document[fields::reference_helper_fields] += reference_helper_field;
-                if (document[field_name].is_array()) {
+
+                std::vector<std::string> keys;
+                StringUtils::split(field_name, keys, ".");
+                if (flat_fields.count(field_name) != 0 && keys.size() == 2 && schema.count(keys[0]) != 0 &&
+                    schema.at(keys[0]).is_array() && document.count(keys[0]) != 0 && document[keys[0]].is_array()) {
+                    // A reference field of an object array has a value for each object that has the reference.
+                    document[reference_helper_field] = nlohmann::json::array();
+                    auto const& object_array = document[keys[0]];
+                    for (uint32_t i = 0; i < object_array.size(); i++) {
+                        if (!object_array[i].is_object() || object_array[i].count(keys[1]) == 0 ||
+                            object_array[i].at(keys[1]).is_null()) {
+                            continue;
+                        }
+                        document[reference_helper_field] +=
+                                object_array_reference_helper_value(i, Join::reference_helper_sentinel_value);
+                    }
+                } else if (document[field_name].is_array()) {
                     document[reference_helper_field] = nlohmann::json::array();
                     // Having the same number of values makes it easier to update the references in the future.
                     document[reference_helper_field].insert(document[reference_helper_field].begin(),
@@ -218,8 +240,8 @@ Option<bool> Join::populate_reference_helper_fields(nlohmann::json& document,
                     auto id = object_array[i].at(keys[1]).get<std::string>();
                     auto ref_doc_id_op = CollectionManager::doc_id_to_seq_id(reference_collection_name, id);
                     if (!ref_doc_id_op.ok() && is_async_reference) {
-                        auto const& value = nlohmann::json::array({i, Join::reference_helper_sentinel_value});
-                        document[reference_helper_field] += value;
+                        document[reference_helper_field] +=
+                                object_array_reference_helper_value(i, Join::reference_helper_sentinel_value);
                     } else if (!ref_doc_id_op.ok()) {
                         return Option<bool>(400, "Referenced document having `id: " + id +
                                                  "` not found in the collection `" +=
@@ -340,7 +362,8 @@ Option<bool> Join::populate_reference_helper_fields(nlohmann::json& document,
                 }
 
                 if (filter_result.count == 0 && is_async_reference) {
-                    document[reference_helper_field] += nlohmann::json::array({i, Join::reference_helper_sentinel_value});
+                    document[reference_helper_field] +=
+                            object_array_reference_helper_value(i, Join::reference_helper_sentinel_value);
                 } else if (filter_result.count != 1) {
                     // Constraints similar to foreign key apply here. The reference match must be unique and not null.
                     return  Option<bool>(400, filter_result.count < 1 ?
