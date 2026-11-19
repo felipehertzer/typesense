@@ -6825,6 +6825,163 @@ TEST_F(CollectionJoinTest, ObjectArrayAsyncReferenceIsLinkedAgain) {
     ASSERT_NO_FATAL_FAILURE(check_references());
 }
 
+TEST_F(CollectionJoinTest, ObjectArrayAsyncReferenceToMissingDocument) {
+    auto schema_json =
+            R"({
+                "name": "publications",
+                "fields": [
+                    {"name": "publication_id", "type": "int64"},
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto publications = collection_create_op.get();
+    ASSERT_TRUE(publications->add(R"({"id": "p3", "publication_id": 3, "name": "Three"})").ok());
+
+    schema_json =
+            R"({
+                "name": "sections",
+                "fields": [
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto sections = collection_create_op.get();
+    ASSERT_TRUE(sections->add(R"({"id": "s2", "name": "Sport"})").ok());
+
+    schema_json =
+            R"({
+                "name": "articles",
+                "enable_nested_fields": true,
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "publication", "type": "object[]", "optional": true},
+                    {"name": "publication.id", "type": "int64[]", "optional": true,
+                        "reference": "publications.publication_id", "async_reference": true},
+                    {"name": "section", "type": "object[]", "optional": true},
+                    {"name": "section.id", "type": "string[]", "optional": true,
+                        "reference": "sections.id", "async_reference": true}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto articles = collection_create_op.get();
+
+    // The first object of each array references a document that doesn't exist yet.
+    auto add_op = articles->add(R"({"id": "a1", "title": "Two publications",
+                                    "publication": [{"id": 2}, {"id": 3}],
+                                    "section": [{"id": "s1"}, {"id": "s2"}]})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto doc = articles->get("a1").get();
+    ASSERT_EQ(R"([[0, 4294967295], [1, 0]])"_json, doc["publication.id_sequence_id"]);
+    ASSERT_EQ(R"([[0, 4294967295], [1, 0]])"_json, doc["section.id_sequence_id"]);
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", "articles"},
+            {"q", "*"},
+            {"include_fields", "$publications(name), $sections(name)"}
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    auto res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, res_obj["found"].get<size_t>());
+    auto hit_doc = res_obj["hits"][0]["document"];
+    ASSERT_EQ(0, hit_doc["publication"][0].count("publications"));
+    ASSERT_EQ("Three", hit_doc["publication"][1]["publications"]["name"]);
+    ASSERT_EQ(0, hit_doc["section"][0].count("sections"));
+    ASSERT_EQ("Sport", hit_doc["section"][1]["sections"]["name"]);
+
+    // The references are linked once the documents are indexed.
+    ASSERT_TRUE(publications->add(R"({"id": "p2", "publication_id": 2, "name": "Two"})").ok());
+    ASSERT_TRUE(sections->add(R"({"id": "s1", "name": "World"})").ok());
+
+    doc = articles->get("a1").get();
+    ASSERT_EQ(R"([[0, 1], [1, 0]])"_json, doc["publication.id_sequence_id"]);
+    ASSERT_EQ(R"([[0, 1], [1, 0]])"_json, doc["section.id_sequence_id"]);
+
+    json_res.clear();
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, res_obj["found"].get<size_t>());
+    hit_doc = res_obj["hits"][0]["document"];
+    ASSERT_EQ("Two", hit_doc["publication"][0]["publications"]["name"]);
+    ASSERT_EQ("Three", hit_doc["publication"][1]["publications"]["name"]);
+    ASSERT_EQ("World", hit_doc["section"][0]["sections"]["name"]);
+    ASSERT_EQ("Sport", hit_doc["section"][1]["sections"]["name"]);
+}
+
+TEST_F(CollectionJoinTest, ObjectArrayAsyncReferenceToMissingCollection) {
+    auto schema_json =
+            R"({
+                "name": "articles",
+                "enable_nested_fields": true,
+                "fields": [
+                    {"name": "title", "type": "string"},
+                    {"name": "publication", "type": "object[]", "optional": true},
+                    {"name": "publication.id", "type": "int64[]", "optional": true,
+                        "reference": "publications.publication_id", "async_reference": true}
+                ]
+            })"_json;
+    auto collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto articles = collection_create_op.get();
+
+    // The second object has no reference.
+    auto add_op = articles->add(R"({"id": "a1", "title": "Two publications",
+                                    "publication": [{"id": 2}, {"name": "No id"}, {"id": 3}]})");
+    ASSERT_TRUE(add_op.ok()) << add_op.error();
+
+    auto doc = articles->get("a1").get();
+    ASSERT_EQ(R"([[0, 4294967295], [2, 4294967295]])"_json, doc["publication.id_sequence_id"]);
+
+    schema_json =
+            R"({
+                "name": "publications",
+                "fields": [
+                    {"name": "publication_id", "type": "int64"},
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+    collection_create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+    auto publications = collection_create_op.get();
+    ASSERT_TRUE(publications->add(R"({"id": "p2", "publication_id": 2, "name": "Two"})").ok());
+    ASSERT_TRUE(publications->add(R"({"id": "p3", "publication_id": 3, "name": "Three"})").ok());
+
+    doc = articles->get("a1").get();
+    ASSERT_EQ(R"([[0, 0], [2, 1]])"_json, doc["publication.id_sequence_id"]);
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", "articles"},
+            {"q", "*"},
+            {"include_fields", "$publications(name)"}
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    auto res_obj = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, res_obj["found"].get<size_t>());
+    auto hit_doc = res_obj["hits"][0]["document"];
+    ASSERT_EQ(3, hit_doc["publication"].size());
+    ASSERT_EQ("Two", hit_doc["publication"][0]["publications"]["name"]);
+    ASSERT_EQ(0, hit_doc["publication"][1].count("publications"));
+    ASSERT_EQ("Three", hit_doc["publication"][2]["publications"]["name"]);
+}
+
 TEST_F(CollectionJoinTest, CascadeDeleteDoesNotHoldParentWhileWaitingForReferencingCollection) {
     auto parent_schema = R"({
         "name": "DeadlockParents",
